@@ -1,92 +1,295 @@
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users } from "../drizzle/schema";
+import mysql from "mysql2/promise";
 import { ENV } from "./_core/env";
+import {
+  papers,
+  collections,
+  paperCollections,
+  searchHistory,
+  analyses,
+  users,
+  InsertPaper,
+  InsertCollection,
+  InsertAnalysis,
+  Paper,
+  Collection,
+  SearchHistoryEntry,
+  Analysis,
+  User,
+} from "../drizzle/schema";
 
-let _db: ReturnType<typeof drizzle> | null = null;
+let dbInstance: any = null;
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
-export async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
-    try {
-      _db = drizzle(process.env.DATABASE_URL);
-    } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
-      _db = null;
-    }
-  }
-  return _db;
-}
+async function getDb() {
+  if (dbInstance) return dbInstance;
 
-export async function upsertUser(user: InsertUser): Promise<void> {
-  if (!user.openId) {
-    throw new Error("User openId is required for upsert");
-  }
-
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
-    return;
+  if (!ENV.databaseUrl) {
+    console.warn("[DB] DATABASE_URL not configured, database features disabled");
+    return null;
   }
 
   try {
-    const values: InsertUser = {
-      openId: user.openId,
-    };
-    const updateSet: Record<string, unknown> = {};
-
-    const textFields = ["name", "email", "loginMethod"] as const;
-    type TextField = (typeof textFields)[number];
-
-    const assignNullable = (field: TextField) => {
-      const value = user[field];
-      if (value === undefined) return;
-      const normalized = value ?? null;
-      values[field] = normalized;
-      updateSet[field] = normalized;
-    };
-
-    textFields.forEach(assignNullable);
-
-    if (user.lastSignedIn !== undefined) {
-      values.lastSignedIn = user.lastSignedIn;
-      updateSet.lastSignedIn = user.lastSignedIn;
-    }
-    if (user.role !== undefined) {
-      values.role = user.role;
-      updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
-      values.role = "admin";
-      updateSet.role = "admin";
-    }
-
-    if (!values.lastSignedIn) {
-      values.lastSignedIn = new Date();
-    }
-
-    if (Object.keys(updateSet).length === 0) {
-      updateSet.lastSignedIn = new Date();
-    }
-
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
-      set: updateSet,
-    });
+    const pool = mysql.createPool(ENV.databaseUrl);
+    dbInstance = drizzle(pool);
+    return dbInstance;
   } catch (error) {
-    console.error("[Database] Failed to upsert user:", error);
-    throw error;
+    console.error("[DB] Failed to connect:", error);
+    return null;
   }
 }
 
-export async function getUserByOpenId(openId: string) {
+// ============================================================================
+// USER MANAGEMENT
+// ============================================================================
+
+export async function getUserByOpenId(openId: string): Promise<User | undefined> {
   const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get user: database not available");
-    return undefined;
-  }
+  if (!db) return undefined;
 
-  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
-  return result.length > 0 ? result[0] : undefined;
+  const result = await db.select().from(users).where(eq(users.openId, openId));
+  return result[0];
 }
 
-// TODO: add feature queries here as your schema grows.
+export async function upsertUser(data: {
+  openId: string;
+  name?: string | null;
+  email?: string | null;
+  loginMethod?: string | null;
+  lastSignedIn?: Date;
+}): Promise<User> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const existing = await getUserByOpenId(data.openId);
+
+  if (existing) {
+    const updateData: Record<string, any> = {};
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.email !== undefined) updateData.email = data.email;
+    if (data.loginMethod !== undefined) updateData.loginMethod = data.loginMethod;
+    if (data.lastSignedIn !== undefined) updateData.lastSignedIn = data.lastSignedIn;
+
+    if (Object.keys(updateData).length > 0) {
+      await db.update(users).set(updateData).where(eq(users.openId, data.openId));
+    }
+
+    return (await getUserByOpenId(data.openId))!;
+  }
+
+  await db.insert(users).values({
+    openId: data.openId,
+    name: data.name || null,
+    email: data.email || null,
+    loginMethod: data.loginMethod || null,
+    lastSignedIn: data.lastSignedIn || new Date(),
+  });
+
+  return (await getUserByOpenId(data.openId))!;
+}
+
+// ============================================================================
+// PAPERS
+// ============================================================================
+
+export async function savePaper(data: InsertPaper): Promise<number> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const result = await db.insert(papers).values(data);
+  return result[0]?.insertId || 0;
+}
+
+export async function getUserPapers(userId: number): Promise<Paper[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  return db.select().from(papers).where(eq(papers.userId, userId));
+}
+
+export async function getPaperById(paperId: number): Promise<Paper | undefined> {
+  const db = await getDb();
+  if (!db) return undefined;
+
+  const result = await db.select().from(papers).where(eq(papers.id, paperId));
+  return result[0];
+}
+
+export async function deletePaper(paperId: number): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  await db.delete(papers).where(eq(papers.id, paperId));
+}
+
+export async function updatePaper(
+  paperId: number,
+  data: Partial<InsertPaper>
+): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  await db.update(papers).set(data).where(eq(papers.id, paperId));
+}
+
+// ============================================================================
+// COLLECTIONS
+// ============================================================================
+
+export async function createCollection(data: InsertCollection): Promise<number> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const result = await db.insert(collections).values(data);
+  return result[0]?.insertId || 0;
+}
+
+export async function getUserCollections(userId: number): Promise<Collection[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  return db.select().from(collections).where(eq(collections.userId, userId));
+}
+
+export async function getCollectionById(collectionId: number): Promise<Collection | undefined> {
+  const db = await getDb();
+  if (!db) return undefined;
+
+  const result = await db.select().from(collections).where(eq(collections.id, collectionId));
+  return result[0];
+}
+
+export async function updateCollection(
+  collectionId: number,
+  data: Partial<InsertCollection>
+): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  await db.update(collections).set(data).where(eq(collections.id, collectionId));
+}
+
+export async function deleteCollection(collectionId: number): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  // Delete all paper-collection associations
+  await db
+    .delete(paperCollections)
+    .where(eq(paperCollections.collectionId, collectionId));
+
+  // Delete the collection
+  await db.delete(collections).where(eq(collections.id, collectionId));
+}
+
+// ============================================================================
+// PAPER COLLECTIONS (ASSOCIATIONS)
+// ============================================================================
+
+export async function addPaperToCollection(
+  paperId: number,
+  collectionId: number
+): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  await db.insert(paperCollections).values({
+    paperId,
+    collectionId,
+  });
+}
+
+export async function removePaperFromCollection(
+  paperId: number,
+  collectionId: number
+): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  await db
+    .delete(paperCollections)
+    .where(
+      and(
+        eq(paperCollections.paperId, paperId),
+        eq(paperCollections.collectionId, collectionId)
+      )
+    );
+}
+
+export async function getCollectionPapers(collectionId: number): Promise<Paper[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  const associations = await db
+    .select()
+    .from(paperCollections)
+    .where(eq(paperCollections.collectionId, collectionId));
+
+  if (associations.length === 0) return [];
+
+  const paperIds = associations.map((a: any) => a.paperId);
+  const result = await db
+    .select()
+    .from(papers)
+    .where(eq(papers.id, paperIds[0]));
+
+  return result;
+}
+
+// ============================================================================
+// SEARCH HISTORY
+// ============================================================================
+
+export async function saveSearchHistory(
+  userId: number,
+  query: string,
+  sources: string[],
+  resultCount: number,
+  filters?: Record<string, any>
+): Promise<number> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const result = await db.insert(searchHistory).values({
+    userId,
+    query,
+    sources: JSON.stringify(sources),
+    resultCount,
+    filters: filters || {},
+  });
+  return result[0]?.insertId || 0;
+}
+
+export async function getUserSearchHistory(userId: number): Promise<SearchHistoryEntry[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  return db.select().from(searchHistory).where(eq(searchHistory.userId, userId));
+}
+
+// ============================================================================
+// ANALYSES
+// ============================================================================
+
+export async function saveAnalysis(data: InsertAnalysis): Promise<number> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const result = await db.insert(analyses).values(data);
+  return result[0]?.insertId || 0;
+}
+
+export async function getUserAnalyses(userId: number): Promise<Analysis[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  return db.select().from(analyses).where(eq(analyses.userId, userId));
+}
+
+export async function getAnalysisById(analysisId: number): Promise<Analysis | undefined> {
+  const db = await getDb();
+  if (!db) return undefined;
+
+  const result = await db.select().from(analyses).where(eq(analyses.id, analysisId));
+  return result[0];
+}
