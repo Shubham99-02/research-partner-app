@@ -107,3 +107,12 @@
 - API keys should be stored securely in environment variables
 - All paper data should include proper attribution to source
 - Export formats should support standard citation managers
+
+## Phase 11: PDF Export Features
+
+- [x] Create PDF generator service (papers, collections, analyses, search results)
+- [x] Implement tRPC routes for PDF export
+- [x] Create PDFExportButton component for React Native
+- [x] Add file system integration for saving PDFs
+- [x] Implement sharing functionality for exported PDFs
+- [x] Support multiple PDF formats (single paper, collection, analysis, search results)
